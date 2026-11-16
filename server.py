@@ -930,6 +930,154 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
         return _error(e)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# THEMES & PRODUCT TEMPLATES
+# Safety rules (live store):
+#   - Writes are limited to NEW product templates: templates/product.<suffix>.json
+#   - The default templates/product.json can never be written
+#   - An existing template is never overwritten unless overwrite=True
+#   - Nothing is published or deleted; a new template only affects a product
+#     once it is assigned with shopify_assign_product_template
+# ═══════════════════════════════════════════════════════════════════════════
+
+import re as _re
+
+_TEMPLATE_KEY_RE = _re.compile(r"^templates/product\.[a-z0-9][a-z0-9_-]*\.json$")
+
+
+@mcp.tool(
+    name="shopify_get_access_scopes",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_access_scopes(params: EmptyInput) -> str:
+    """List the API permissions (scopes) this app currently has on the store."""
+    try:
+        token = await token_manager.get_token()
+        url = f"https://{SHOPIFY_STORE}.myshopify.com/admin/oauth/access_scopes.json"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers={"X-Shopify-Access-Token": token}, timeout=30.0)
+            resp.raise_for_status()
+            scopes = [s["handle"] for s in resp.json().get("access_scopes", [])]
+        return _fmt({"count": len(scopes), "scopes": sorted(scopes)})
+    except Exception as e:
+        return _error(e)
+
+
+@mcp.tool(
+    name="shopify_list_themes",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_themes(params: EmptyInput) -> str:
+    """List the store's themes with their IDs and roles (role 'main' = the live theme)."""
+    try:
+        data = await _request("GET", "themes.json")
+        themes = [{"id": t["id"], "name": t["name"], "role": t["role"]} for t in data.get("themes", [])]
+        return _fmt({"count": len(themes), "themes": themes})
+    except Exception as e:
+        return _error(e)
+
+
+class ListThemeFilesInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    theme_id: int           = Field(..., description="Theme ID (from shopify_list_themes)")
+    prefix:   Optional[str] = Field(default="templates/product", description="Only return files whose key starts with this, e.g. templates/product, sections/, snippets/")
+
+
+@mcp.tool(
+    name="shopify_list_theme_files",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_theme_files(params: ListThemeFilesInput) -> str:
+    """List file names in a theme, filtered by prefix (default: product templates)."""
+    try:
+        data = await _request("GET", f"themes/{params.theme_id}/assets.json", params={"fields": "key,updated_at,size"})
+        files = [a for a in data.get("assets", []) if a["key"].startswith(params.prefix or "")]
+        return _fmt({"count": len(files), "files": files})
+    except Exception as e:
+        return _error(e)
+
+
+class GetThemeFileInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    theme_id: int = Field(..., description="Theme ID (from shopify_list_themes)")
+    key:      str = Field(..., description="File key, e.g. templates/product.roueceleste.json")
+
+
+@mcp.tool(
+    name="shopify_get_theme_file",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_theme_file(params: GetThemeFileInput) -> str:
+    """Read one theme file's full content (e.g. a product template JSON)."""
+    try:
+        data = await _request("GET", f"themes/{params.theme_id}/assets.json", params={"asset[key]": params.key})
+        asset = data.get("asset", {})
+        return asset.get("value") or _fmt(asset)
+    except Exception as e:
+        return _error(e)
+
+
+class SaveProductTemplateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    theme_id:  int  = Field(..., description="Theme ID (from shopify_list_themes)")
+    suffix:    str  = Field(..., description="Template suffix, lowercase letters/numbers/-/_ only, e.g. 'ohanaglow' -> templates/product.ohanaglow.json")
+    content:   str  = Field(..., description="Full JSON content of the template")
+    overwrite: bool = Field(default=False, description="Must be true to replace a template that already exists")
+
+
+@mcp.tool(
+    name="shopify_save_product_template",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_save_product_template(params: SaveProductTemplateInput) -> str:
+    """Create (or, with overwrite=true, update) a product template file templates/product.<suffix>.json.
+    Cannot touch the default product.json or any other file. A new template does not change any
+    product until it is assigned with shopify_assign_product_template. Preview it first at
+    /products/<handle>?view=<suffix>."""
+    try:
+        key = f"templates/product.{params.suffix}.json"
+        if not _TEMPLATE_KEY_RE.match(key):
+            return "Refused: suffix must be lowercase letters, numbers, '-' or '_' (and not empty)."
+        try:
+            json.loads(params.content)
+        except Exception as je:
+            return f"Refused: content is not valid JSON ({je})."
+        existing = await _request("GET", f"themes/{params.theme_id}/assets.json", params={"fields": "key"})
+        exists = any(a["key"] == key for a in existing.get("assets", []))
+        if exists and not params.overwrite:
+            return f"Refused: {key} already exists. Pass overwrite=true only if the user confirmed replacing it."
+        data = await _request("PUT", f"themes/{params.theme_id}/assets.json",
+                              body={"asset": {"key": key, "value": params.content}})
+        a = data.get("asset", {})
+        return _fmt({"saved": a.get("key", key), "updated_at": a.get("updated_at"), "was_existing": exists})
+    except Exception as e:
+        return _error(e)
+
+
+class AssignTemplateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id: int = Field(..., description="Product ID")
+    suffix:     str = Field(..., description="Template suffix to assign, e.g. 'ohanaglow'. Use '' for the default template.")
+
+
+@mcp.tool(
+    name="shopify_assign_product_template",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_assign_product_template(params: AssignTemplateInput) -> str:
+    """Assign a product template to a product (changes the LIVE product page — only after the user approves)."""
+    try:
+        if params.suffix and not _re.match(r"^[a-z0-9][a-z0-9_-]*$", params.suffix):
+            return "Refused: invalid suffix."
+        data = await _request("PUT", f"products/{params.product_id}.json",
+                              body={"product": {"id": params.product_id, "template_suffix": params.suffix or None}})
+        p = data.get("product", {})
+        return _fmt({"product_id": p.get("id"), "title": p.get("title"), "handle": p.get("handle"),
+                     "template_suffix": p.get("template_suffix")})
+    except Exception as e:
+        return _error(e)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
