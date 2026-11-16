@@ -1317,8 +1317,99 @@ async def shopify_update_page(params: UpdatePageInput) -> str:
         return _error(e)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# DELETES (guarded)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DeleteThemeFileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id:     int  = Field(..., description="Theme ID")
+    key:          str  = Field(..., description="File key to delete")
+    confirm_live: bool = Field(default=False, description="Must be true to delete on the LIVE theme")
+
+
+@mcp.tool(
+    name="shopify_delete_theme_file",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_delete_theme_file(params: DeleteThemeFileInput) -> str:
+    """Delete one theme file. Non-backup files are backed up first (restore with shopify_restore_theme_file)."""
+    try:
+        key = params.key.strip()
+        if not key.startswith(_WRITABLE_PREFIXES) or ".." in key:
+            return "Refused: only templates/, sections/, snippets/, blocks/ or assets/ files can be deleted."
+        role = await _theme_role(params.theme_id)
+        if role == "main" and not params.confirm_live:
+            return "Refused: this is the LIVE theme. Pass confirm_live=true only after the user approved this deletion."
+        old = await _read_asset(params.theme_id, key)
+        if old is None:
+            return "File not found."
+        backup_key = None
+        if not key.startswith(_BACKUP_PREFIX):
+            ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            flat = _re.sub(r"[^a-zA-Z0-9_.-]", "_", key.replace("/", "__"))
+            backup_key = f"{_BACKUP_PREFIX}{ts}-{flat}.txt"
+            await _write_asset(params.theme_id, backup_key, json.dumps({"key": key, "value": old}))
+        await _request("DELETE", f"themes/{params.theme_id}/assets.json", params={"asset[key]": key})
+        return _fmt({"deleted": key, "backup": backup_key})
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteThemeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id: int = Field(..., description="ID of an UNPUBLISHED theme to delete")
+
+
+@mcp.tool(
+    name="shopify_delete_theme",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_delete_theme(params: DeleteThemeInput) -> str:
+    """Delete an unpublished theme (the live theme can never be deleted). Only after the user asked."""
+    try:
+        role = await _theme_role(params.theme_id)
+        if role != "unpublished":
+            return f"Refused: theme role is '{role}'. Only unpublished themes can be deleted."
+        data = await _request("DELETE", f"themes/{params.theme_id}.json")
+        t = data.get("theme", {})
+        return _fmt({"deleted_theme": t.get("id", params.theme_id), "name": t.get("name")})
+    except Exception as e:
+        return _error(e)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    mcp.run(transport=MCP_TRANSPORT)
+    MCP_SECRET = os.environ.get("MCP_SECRET", "")
+    if MCP_TRANSPORT == "streamable-http" and MCP_SECRET:
+        # Lock the server: every request must carry the secret, either as
+        #   ?key=<secret> in the URL, or an "Authorization: Bearer <secret>" header.
+        import hmac
+        import uvicorn
+        from urllib.parse import parse_qs
+
+        inner = mcp.streamable_http_app()
+
+        async def secured_app(scope, receive, send):
+            if scope["type"] == "http":
+                qs = parse_qs(scope.get("query_string", b"").decode())
+                given = (qs.get("key") or [""])[0]
+                if not given:
+                    auth = dict(scope.get("headers") or []).get(b"authorization", b"").decode()
+                    if auth.lower().startswith("bearer "):
+                        given = auth[7:].strip()
+                if not hmac.compare_digest(given.encode(), MCP_SECRET.encode()):
+                    await send({"type": "http.response.start", "status": 401,
+                                "headers": [(b"content-type", b"text/plain")]})
+                    await send({"type": "http.response.body", "body": b"Unauthorized"})
+                    return
+            await inner(scope, receive, send)
+
+        logger.info("MCP_SECRET set: server locked (key required)")
+        uvicorn.run(secured_app, host="0.0.0.0", port=PORT)
+    else:
+        if not MCP_SECRET:
+            logger.warning("MCP_SECRET not set: server is OPEN to anyone with the URL")
+        mcp.run(transport=MCP_TRANSPORT)
