@@ -1078,6 +1078,245 @@ async def shopify_assign_product_template(params: AssignTemplateInput) -> str:
         return _error(e)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# THEME FILES (sections, snippets, templates, assets) — with automatic backup
+# Safety rules:
+#   - Only templates/, sections/, snippets/, blocks/ and assets/ can be written
+#     (layout/, config/ and locales/ are refused)
+#   - Writing to the LIVE theme (role "main") is refused unless confirm_live=True
+#   - Before any overwrite, the old file is saved as
+#     assets/backup-<timestamp>-<file>.txt  (JSON: {"key", "value"})
+#     and can be put back with shopify_restore_theme_file
+# ═══════════════════════════════════════════════════════════════════════════
+
+_WRITABLE_PREFIXES = ("templates/", "sections/", "snippets/", "blocks/", "assets/")
+_BACKUP_PREFIX = "assets/backup-"
+
+
+async def _theme_role(theme_id: int) -> str:
+    data = await _request("GET", f"themes/{theme_id}.json")
+    return data.get("theme", {}).get("role", "")
+
+
+async def _read_asset(theme_id: int, key: str) -> Optional[str]:
+    try:
+        data = await _request("GET", f"themes/{theme_id}/assets.json", params={"asset[key]": key})
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return None
+        raise
+    return data.get("asset", {}).get("value")
+
+
+async def _write_asset(theme_id: int, key: str, value: str) -> dict:
+    data = await _request("PUT", f"themes/{theme_id}/assets.json",
+                          body={"asset": {"key": key, "value": value}})
+    return data.get("asset", {})
+
+
+class SaveThemeFileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id:     int  = Field(..., description="Theme ID (from shopify_list_themes)")
+    key:          str  = Field(..., description="File key, e.g. sections/sapin-hero.liquid or templates/product.sapin.json")
+    content:      str  = Field(..., description="Full new content of the file")
+    confirm_live: bool = Field(default=False, description="Must be true to write to the LIVE theme (only after the user approved)")
+
+
+@mcp.tool(
+    name="shopify_save_theme_file",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_save_theme_file(params: SaveThemeFileInput) -> str:
+    """Create or update a theme file (section, snippet, template, block or asset).
+    The previous version is backed up automatically (see shopify_restore_theme_file).
+    Writing to the live theme needs confirm_live=true."""
+    try:
+        key = params.key.strip()
+        if not key.startswith(_WRITABLE_PREFIXES) or ".." in key or key.startswith(_BACKUP_PREFIX):
+            return "Refused: only templates/, sections/, snippets/, blocks/ or assets/ files can be written."
+        if key.endswith(".json"):
+            try:
+                json.loads(params.content)
+            except Exception as je:
+                return f"Refused: content is not valid JSON ({je})."
+        role = await _theme_role(params.theme_id)
+        if role == "main" and not params.confirm_live:
+            return "Refused: this is the LIVE theme. Pass confirm_live=true only after the user approved this exact change."
+        old = await _read_asset(params.theme_id, key)
+        backup_key = None
+        if old is not None:
+            if old == params.content:
+                return _fmt({"saved": key, "changed": False, "note": "content identical, nothing written"})
+            ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            flat = _re.sub(r"[^a-zA-Z0-9_.-]", "_", key.replace("/", "__"))
+            backup_key = f"{_BACKUP_PREFIX}{ts}-{flat}.txt"
+            await _write_asset(params.theme_id, backup_key, json.dumps({"key": key, "value": old}))
+        a = await _write_asset(params.theme_id, key, params.content)
+        return _fmt({"saved": a.get("key", key), "updated_at": a.get("updated_at"),
+                     "theme_role": role, "was_existing": old is not None, "backup": backup_key})
+    except Exception as e:
+        return _error(e)
+
+
+class RestoreThemeFileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id:     int  = Field(..., description="Theme ID")
+    backup_key:   str  = Field(..., description="Backup file key, e.g. assets/backup-20261116-201500-sections__hero.liquid.txt (list them with shopify_list_theme_files prefix 'assets/backup-')")
+    confirm_live: bool = Field(default=False, description="Must be true to restore on the LIVE theme")
+
+
+@mcp.tool(
+    name="shopify_restore_theme_file",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_restore_theme_file(params: RestoreThemeFileInput) -> str:
+    """Put a theme file back to a backed-up version (undo a shopify_save_theme_file)."""
+    try:
+        if not params.backup_key.startswith(_BACKUP_PREFIX):
+            return "Refused: not a backup file."
+        role = await _theme_role(params.theme_id)
+        if role == "main" and not params.confirm_live:
+            return "Refused: this is the LIVE theme. Pass confirm_live=true only after the user approved the restore."
+        raw = await _read_asset(params.theme_id, params.backup_key)
+        if raw is None:
+            return "Backup not found."
+        b = json.loads(raw)
+        a = await _write_asset(params.theme_id, b["key"], b["value"])
+        return _fmt({"restored": b["key"], "from": params.backup_key, "updated_at": a.get("updated_at")})
+    except Exception as e:
+        return _error(e)
+
+
+class DuplicateThemeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    theme_id: int           = Field(..., description="Theme ID to copy (e.g. the live theme)")
+    name:     Optional[str] = Field(default=None, description="Name of the copy")
+
+
+@mcp.tool(
+    name="shopify_duplicate_theme",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_duplicate_theme(params: DuplicateThemeInput) -> str:
+    """Make an unpublished copy of a theme (safe place to test edits, or a full backup)."""
+    try:
+        token = await token_manager.get_token()
+        query = ("mutation($id: ID!, $name: String) { themeDuplicate(id: $id, name: $name) "
+                 "{ newTheme { id name role } userErrors { field message } } }")
+        variables = {"id": f"gid://shopify/OnlineStoreTheme/{params.theme_id}", "name": params.name}
+        url = f"https://{SHOPIFY_STORE}.myshopify.com/admin/api/2025-10/graphql.json"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json={"query": query, "variables": variables},
+                                     headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
+                                     timeout=60.0)
+            resp.raise_for_status()
+            data = resp.json()
+        if data.get("errors"):
+            return _fmt({"errors": data["errors"]})
+        return _fmt(data["data"]["themeDuplicate"])
+    except Exception as e:
+        return _error(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGES (Online Store pages: About, Contact, FAQ…)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ListPagesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    limit: Optional[int] = Field(default=50, ge=1, le=250)
+
+
+@mcp.tool(
+    name="shopify_list_pages",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_pages(params: ListPagesInput) -> str:
+    """List the store's pages (id, title, handle, published, template)."""
+    try:
+        data = await _request("GET", "pages.json", params={"limit": params.limit,
+                              "fields": "id,title,handle,published_at,template_suffix,updated_at"})
+        pages = data.get("pages", [])
+        return _fmt({"count": len(pages), "pages": pages})
+    except Exception as e:
+        return _error(e)
+
+
+class GetPageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    page_id: int = Field(..., description="Page ID")
+
+
+@mcp.tool(
+    name="shopify_get_page",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_page(params: GetPageInput) -> str:
+    """Get one page with its full HTML content."""
+    try:
+        data = await _request("GET", f"pages/{params.page_id}.json")
+        return _fmt(data.get("page", data))
+    except Exception as e:
+        return _error(e)
+
+
+class CreatePageInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    title:           str            = Field(..., min_length=1)
+    body_html:       Optional[str]  = Field(default=None, description="HTML content")
+    handle:          Optional[str]  = Field(default=None, description="URL handle, e.g. 'faq' -> /pages/faq")
+    template_suffix: Optional[str]  = Field(default=None, description="Page template suffix, e.g. 'contact'")
+    published:       bool           = Field(default=False, description="Hidden by default; set true to publish")
+
+
+@mcp.tool(
+    name="shopify_create_page",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_page(params: CreatePageInput) -> str:
+    """Create a page (hidden unless published=true)."""
+    try:
+        page: Dict[str, Any] = {"title": params.title, "published": params.published}
+        for f in ["body_html", "handle", "template_suffix"]:
+            v = getattr(params, f)
+            if v is not None:
+                page[f] = v
+        data = await _request("POST", "pages.json", body={"page": page})
+        return _fmt(data.get("page", data))
+    except Exception as e:
+        return _error(e)
+
+
+class UpdatePageInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    page_id:         int            = Field(..., description="Page ID")
+    title:           Optional[str]  = Field(default=None)
+    body_html:       Optional[str]  = Field(default=None)
+    handle:          Optional[str]  = Field(default=None)
+    template_suffix: Optional[str]  = Field(default=None)
+    published:       Optional[bool] = Field(default=None)
+
+
+@mcp.tool(
+    name="shopify_update_page",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_page(params: UpdatePageInput) -> str:
+    """Update a page. Only provided fields change. Returns the previous version too, so it can be undone."""
+    try:
+        before = (await _request("GET", f"pages/{params.page_id}.json")).get("page", {})
+        page: Dict[str, Any] = {"id": params.page_id}
+        for f in ["title", "body_html", "handle", "template_suffix", "published"]:
+            v = getattr(params, f)
+            if v is not None:
+                page[f] = v
+        data = await _request("PUT", f"pages/{params.page_id}.json", body={"page": page})
+        prev = {k: before.get(k) for k in ["title", "body_html", "handle", "template_suffix", "published_at"]}
+        return _fmt({"page": data.get("page", data), "previous": prev})
+    except Exception as e:
+        return _error(e)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
