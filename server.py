@@ -1401,9 +1401,9 @@ if __name__ == "__main__":
                     if auth.lower().startswith("bearer "):
                         given = auth[7:].strip()
                 if not hmac.compare_digest(given.encode(), MCP_SECRET.encode()):
-                    await send({"type": "http.response.start", "status": 401,
+                    await send({"type": "http.response.start", "status": 404,
                                 "headers": [(b"content-type", b"text/plain")]})
-                    await send({"type": "http.response.body", "body": b"Unauthorized"})
+                    await send({"type": "http.response.body", "body": b"Not Found"})
                     return
             await inner(scope, receive, send)
 
